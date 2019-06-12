@@ -7,6 +7,7 @@ import * as assert from "assert";
 const encoding = "utf8";
 const moduleKeyword = "module_";
 const useRequireOnce = true;
+const useIIFE = true;
 
 function getTsConfig(cwd: string) {
 	const file = ts.findConfigFile(cwd, ts.sys.fileExists) as string;
@@ -60,6 +61,8 @@ function buildFile(tsConfig: ts.ParsedCommandLine, services: ts.LanguageService,
 	const relativePath = path.relative(tsConfig.options.baseUrl, fileName); // ../event/eventA.ts | moduleA.ts | folder/moduleB.ts
 	const isInModules = relativePath.indexOf("..") == -1; // in "modules/"
 	const moduleName = path.basename(isInModules ? replaceSeparator(relativePath) : fileName, ".ts"); // "moduleA" | "folder__moduleB" | "eventA" | "eventB"
+
+	const newLine: string = ts["getNewLineCharacter"](tsConfig.options);
 
 	interface RenameInfo {
 		renameLocation: ts.RenameLocation,
@@ -277,33 +280,89 @@ function buildFile(tsConfig: ts.ParsedCommandLine, services: ts.LanguageService,
 			});
 		}
 	}
+	/**
+	 * Wrap in an IIFE.
+	 * Gamesparks requireOnce works differently from require:
+	 * * It's a textual include, and will splat everything into the global namespace
+	 * * It doesn't know about exports
+	 * * It doesn't return anything
+	 * So we need:
+	 * * An IIFE to encapsulate the module's stuff
+	 * * To declare exports = {} so it can be filled with stuff to export
+	 * * To declare a global variable named as the module, containing those exports
+	 * @example
+	 * // before (in module "abc")
+	 * var module = require("module");
+	 * exports.xyz = function () {return module.xyz();};
+	 * // after
+	 * requireOnce("module");
+	 * var abc = (function () {
+	 * var exports = {};
+	 * exports.xyz = function () {return module.xyz();};
+	 * return exports;
+	 * })();
+	 */
+    function wrapInIIFE(js: string, varName: string) {
+        // Get a list of all imports
+        const imports = [];
+        tsSourceFile.forEachChild(function (node) {
+            if (ts.isImportDeclaration(node)) {
+				// @ts-ignore
+				imports.push(node.moduleSpecifier.text);
+            }
+        });
+        // It would be nice to just kill the nodes above, but I don't know how to do that,
+        // so now they are fixed with regex replaces
+        const requireOnces = imports.map(function (mod) {
+            js = js.replace('var ' + mod + ' = require("' + mod + '");' + newLine, '');
+            return 'requireOnce("' + mod + '");' + newLine;
+        });
+        // Any "use strict" line must come first, before declaring exports
+        const useStrict = '"use strict";' + newLine;
+        let newUseStrict = '';
+        if (js.startsWith(useStrict)) {
+            js = js.substr(useStrict.length);
+            newUseStrict = useStrict;
+        }
+        // Wrap js in an IIFE that declares and returns exports
+        return requireOnces.join('') +
+                'var ' + varName + ' = (function () {' + newLine +
+                newUseStrict +
+                'var exports = {};' + newLine +
+                js +
+                'return exports;' + newLine +
+                '})();' + newLine;
+    }
 	function doOutput() {
 		/**
 		 * Remove "__esModule"
 		 */
-		const newLine = ts["getNewLineCharacter"](tsConfig.options);
 		let js = ts.transpileModule(ts.createPrinter().printFile(tsSourceFile), { compilerOptions: tsConfig.options }).outputText;
 		js = js.replace('Object.defineProperty(exports, "__esModule", { value: true });' + newLine, "");
 
-		/**
-		 * Fix import self
-		 * 
-		 * @example
-		 * // moduleA.ts
-		 * import * as ModuleA from "moduleA";
-		 * export funcA() { }
-		 * ModuleA.funcA();
-		 * // moduleA.js
-		 * ...
-		 * module_moduleA.module_moduleA_funcA();
-		 * // fix moduleA.js
-		 * ...
-		 * module_moduleA.funcA();
-		 */
-		for (const importModule of importModules) {
-			assert.equal(importModule.indexOf(".."), -1, "Relative path is not supported on Cloud Code.");
+        if (useIIFE) {
+            js = wrapInIIFE(js, moduleName);
+        } else {
+			/**
+			 * Fix import self
+			 * 
+			 * @example
+			 * // moduleA.ts
+			 * import * as ModuleA from "moduleA";
+			 * export funcA() { }
+			 * ModuleA.funcA();
+			 * // moduleA.js
+			 * ...
+			 * module_moduleA.module_moduleA_funcA();
+			 * // fix moduleA.js
+			 * ...
+			 * module_moduleA.funcA();
+			 */
+			for (const importModule of importModules) {
+				assert.equal(importModule.indexOf(".."), -1, "Relative path is not supported on Cloud Code.");
 
-			js = js.replace(new RegExp(moduleKeyword + importModule + "." + moduleKeyword + importModule + "_", "g"), moduleKeyword + importModule + ".");
+				js = js.replace(new RegExp(moduleKeyword + importModule + "." + moduleKeyword + importModule + "_", "g"), moduleKeyword + importModule + ".");
+			}
 		}
 
 		/**
@@ -330,7 +389,7 @@ function buildFile(tsConfig: ts.ParsedCommandLine, services: ts.LanguageService,
 	}
 
 	const dirname = path.dirname(fileName).split("/").pop();
-	if (dirname != "rtScript" && dirname != "rtModules") {
+	if (dirname != "rtScript" && dirname != "rtModules" && !useIIFE) {
 		doRenaming();
 		doRefactoring();
 	}

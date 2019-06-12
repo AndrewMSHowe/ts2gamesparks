@@ -2,7 +2,7 @@
 
 ### Install ts2gamesparks
 ```
-$ npm install -g git+https://github.com/johnsoncodehk/ts2gamesparks.git
+$ npm install -g git+https://github.com/AndrewMSHowe/ts2gamesparks.git
 ```
 
 ### Install GameSparks typings
